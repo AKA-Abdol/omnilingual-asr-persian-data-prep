@@ -24,12 +24,12 @@ from fairseq2.data.data_pipeline import FileMapper, read_sequence
 from numpy.typing import NDArray
 
 
-def map_to_target_schema(batch: pa.Table, split: str, corpus: str) -> pa.Table:
+def map_to_target_schema(batch: pa.Table, split: str, corpus: str, text_column: str = "transcription") -> pa.Table:
     """
     Maps a batch of data to the target schema by flattening, renaming columns,
     adding audio bytes, split, and corpus columns, and selecting the final set of columns.
     """
-    batch = batch.rename_columns({"transcription": "text"})
+    batch = batch.rename_columns({text_column: "text"})
     batch = batch.append_column(
         "split", pa.array([split] * len(batch), type=pa.string())
     )
@@ -233,6 +233,14 @@ class AudioTableProcessor:
         table = table.append_column(
             "audio_size", pa.array(audio_sizes, type=pa.int64())
         ).append_column("audio_bytes", pa.array(audio_bytes, type=pa.list_(pa.int8())))
+
+        # Filter None audio_sizes
+        valid_indices = [
+            i
+            for i, size in enumerate(audio_sizes)
+            if size is not None
+        ]
+        table = table.take(valid_indices)
         return table
 
 

@@ -10,10 +10,12 @@ polars>=1.29.0
 fire
 transformers
 datasets~=3.6.0
-"ray[default,data]">=2.49.0
+ray[default,data]>=2.49.0
 soundfile>=0.13.1
 librosa>=0.11.0
 unidecode
 uroman
 fire
 retrying
+persian-tools
+hazm

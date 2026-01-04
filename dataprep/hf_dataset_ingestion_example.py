@@ -20,6 +20,14 @@ from audio_tools import AudioTableProcessor, map_to_target_schema
 from datasets import load_dataset
 from text_tools import text_normalize
 import hazm
+import html
+import logging
+import numpy as np
+
+logger = logging.getLogger("ray")
+logger.setLevel(logging.ERROR)
+ray_data_logger = logging.getLogger("ray.data")
+ray_data_logger.setLevel(logging.ERROR)
 
 
 class MLSTextProcessor:
@@ -234,31 +242,85 @@ chars_to_mapping = {
     "ﻭ": "و",
     "ﺭ": "ر",
     "ﮔ": "گ",
+    "\u202b": " ",
     "\u200c": " ",
     "\u200d": " ",
     "\u200e": " ",
     "\u200f": " ",
     "\ufeff": " ",
+    "\u200b": " ",
+    "\u200C": " ",
+    '\u200B': " ",  # Zero-Width Space (the problematic one: \xe2\x80\xab)
+    '\u200E': " ",  # Left-to-Right Mark
+    '\u200F': " ",  # Right-to-Left Mark
+    '\uFEFF': " ",  # Zero-Width No-Break Space (BOM)
+    '\u2060': " ",  # Word Joiner
+    '\u2061': " ",  # Function Application
+    '\u2062': " ",  # Invisible Times
+    '\u2063': " ",  # Invisible Separator
+    '\u2064': " ",  # Invisible Plus
+    '\u180E': " ",  # Mongolian Vowel Separator
+    '\u2000': " ",  # En Quad
+    '\u2001': " ",  # Em Quad
+    '\u2002': " ",  # En Space
+    '\u2003': " ",  # Em Space
+    '\u2004': " ",  # Three-Per-Em Space
+    '\u2005': " ",  # Four-Per-Em Space
+    '\u2006': " ",  # Six-Per-Em Space
+    '\u2007': " ",  # Figure Space
+    '\u2008': " ",  # Punctuation Space
+    '\u2009': " ",  # Thin Space
+    '\u200A': " ",  # Hair Space
+    '♫': "",  # Musical note
+    '♬': "",  # Musical notes
+    '♪': "",  # Musical note
+    '♩': "",  # Musical note
+    '♭': "",  # Flat
+    '♯': "",  # Sharp
+    '♮': "",  # Natural
 }
 
 
 def multiple_replace(text, chars_to_mapping):
-    pattern = "|".join(map(re.escape, chars_to_mapping.keys()))
+    sorted_keys = sorted(chars_to_mapping.keys(), key=len, reverse=True)
+    pattern = "|".join(map(re.escape, sorted_keys))
     return re.sub(pattern, lambda m: chars_to_mapping[m.group()], str(text))
-
 
 def remove_special_characters(text, chars_to_ignore_regex):
     text = re.sub(chars_to_ignore_regex, "", text).lower() + " "
     return text
 
 
+def normalize_html(text: str) -> str:
+    return html.unescape(text)
+
+
+def remove_explanations(text: str) -> str:
+    text = re.compile(r"\*.*\*").sub("", text)
+    text = re.compile(r"\[.*\]").sub("", text)
+    text = re.compile(r"\(.*\)").sub("", text)
+    text = re.compile(r'".*"').sub("", text)
+    return text
+
+
+def replace_invalid_texts(text: str) -> str:
+    replace_list = {r"(\.\s*)+": ".", r"\n": " "}
+    for pattern, replacement in replace_list.items():
+        text = re.sub(pattern, replacement, text)
+    return text
+
 def farsi_text_normalizer(text: str) -> str:
     chars_to_ignore_regex = f"""[{"".join(chars_to_ignore)}]"""
     text = text.strip()
+    text = normalize_html(text)
+    text = remove_explanations(text)
+    text = replace_invalid_texts(text)
     text = hazm_normalizer.normalize(text)
     text = multiple_replace(text, chars_to_mapping)
     text = remove_special_characters(text, chars_to_ignore_regex)
     text = digits.convert_to_en(text)
+    if len(text.strip()) == 0:
+        return ""
     words = []
     for word in text.split():
         if re.match(r"^[0-9]+$", word):
@@ -295,7 +357,8 @@ class FarsiTextProcessor:
         for text in transcriptions:
             processed_text = farsi_text_normalizer(text)
             processed_transcriptions.append(processed_text)
-        print(processed_transcriptions)
+
+        batch = batch.drop([self.text_column])
         batch = batch.append_column(
             "transcription", pa.array(processed_transcriptions, type=pa.string())
         )
@@ -304,6 +367,16 @@ class FarsiTextProcessor:
         batch = batch.append_column(
             "language", pa.array(language_values, type=pa.string())
         )
+        non_empty_indices = [
+            i for i, t in enumerate(processed_transcriptions) if t.strip() != ""
+        ]
+        if non_empty_indices:
+            batch = batch.take(non_empty_indices)
+        else:
+            batch = pa.Table.from_arrays(
+                [pa.array([], type=col.type) for col in batch.itercolumns()],
+                names=batch.column_names,
+            )
         return batch
 
 
@@ -482,10 +555,66 @@ class DataPrepCLI:
                 # Use batch-level text processing
                 ray_ds_stream_ = ray_ds_stream_.map_batches(
                     FarsiTextProcessor,
-                    fn_constructor_args={
-                        "text_column": "sentence"
-                    },
+                    fn_constructor_kwargs={"text_column": "sentence"},
                     batch_size=1000,
+                    batch_format="pyarrow",
+                    concurrency=4,
+                    num_cpus=0.5,
+                )
+
+                # Audio processing
+                ray_ds_stream_ = ray_ds_stream_.map_batches(
+                    AudioTableProcessor,
+                    fn_constructor_kwargs={
+                        "audio_column": "audio.bytes",
+                        "audio_format": "flac",  # or "ogg", "wav", etc.
+                    },
+                    batch_size=50,
+                    batch_format="pyarrow",
+                    concurrency=4,
+                    num_cpus=1,
+                )
+                ray_ds_stream_ = ray_ds_stream_.map_batches(
+                    partial(
+                        map_to_target_schema,
+                        split=split,
+                        corpus="fleurs_yazdi",
+                    ),
+                    batch_size=100,
+                    batch_format="pyarrow",
+                )
+                ray_ds_stream_.write_parquet(
+                    output_dir,
+                    partition_cols=["corpus", "split", "language"],
+                    min_rows_per_file=10_000,
+                    row_group_size=100,  # https://github.com/ray-project/ray/issues/52481
+                )
+
+    def _ingest_youtube_dataset_internal(
+        self, output_dir: str, portion_subset: list[str] | None = None
+    ):
+        """Internal method for FLEURS ingestion."""
+        # see https://huggingface.co/datasets/srezas/farsi_voice_dataset
+
+        for portion in portion_subset:
+            print(f"Ingesting {portion} portion...")
+            for split in ["train", "dev"]:
+                print(f"Ingesting {split} split...")
+                yt = load_dataset(
+                    "AKA-Abdol/Universal-Speech-Dataset",
+                    portion,
+                    split=split,
+                    streaming=True,
+                    trust_remote_code=True,
+                )
+                yt = yt.shuffle(seed=123, buffer_size=1000)
+                ray_ds_stream_ = ray.data.from_huggingface(yt)
+
+                # Use batch-level text processing
+                ray_ds_stream_ = ray_ds_stream_.map_batches(
+                    FarsiTextProcessor,
+                    fn_constructor_kwargs={"text_column": "transcription"},
+                    batch_size=500,
                     batch_format="pyarrow",
                     concurrency=5,
                     num_cpus=0.5,
@@ -496,7 +625,7 @@ class DataPrepCLI:
                     AudioTableProcessor,
                     fn_constructor_kwargs={
                         "audio_column": "audio.bytes",
-                        "audio_format": "mp3",  # or "ogg", "wav", etc.
+                        "audio_format": "flac",  # or "ogg", "wav", etc.
                     },
                     batch_size=50,
                     batch_format="pyarrow",
@@ -519,6 +648,112 @@ class DataPrepCLI:
                     row_group_size=100,  # https://github.com/ray-project/ray/issues/52481
                 )
 
+    def _ingest_filimo_dataset_internal(self, output_dir: str):
+        """Internal method for FLEURS ingestion."""
+        # see https://huggingface.co/datasets/srezas/farsi_voice_dataset
+
+        for split in ["train", "dev", "test"]:
+            print(f"Ingesting {split} split...")
+            filimo = load_dataset(
+                "MohammadGholizadeh/filimo-farsi",
+                split=split,
+                streaming=True,
+                trust_remote_code=True,
+            )
+            filimo = filimo.shuffle(seed=123, buffer_size=1000)
+            ray_ds_stream_ = ray.data.from_huggingface(filimo)
+
+            # Use batch-level text processing
+            ray_ds_stream_ = ray_ds_stream_.map_batches(
+                FarsiTextProcessor,
+                fn_constructor_kwargs={"text_column": "transcription"},
+                batch_size=500,
+                batch_format="pyarrow",
+                concurrency=5,
+                num_cpus=0.5,
+            )
+
+            # Audio processing
+            ray_ds_stream_ = ray_ds_stream_.map_batches(
+                AudioTableProcessor,
+                fn_constructor_kwargs={
+                    "audio_column": "audio.bytes",
+                    "audio_format": "flac",  # or "ogg", "wav", etc.
+                },
+                batch_size=50,
+                batch_format="pyarrow",
+                concurrency=5,
+                num_cpus=1,
+            )
+            ray_ds_stream_ = ray_ds_stream_.map_batches(
+                partial(
+                    map_to_target_schema,
+                    split=split,
+                    corpus="filimo",
+                ),
+                batch_size=100,
+                batch_format="pyarrow",
+            )
+            ray_ds_stream_.write_parquet(
+                output_dir,
+                partition_cols=["corpus", "split", "language"],
+                min_rows_per_file=10_000,
+                row_group_size=100,  # https://github.com/ray-project/ray/issues/52481
+            )
+
+    def _ingest_psbr_dataset_internal(self, output_dir: str):
+        """Internal method for FLEURS ingestion."""
+        # see https://huggingface.co/datasets/srezas/farsi_voice_dataset
+
+        for split in ["test"]:
+            print(f"Ingesting {split} split...")
+            psbr = load_dataset(
+                "AKA-Abdol/part-psbr",
+                split=split,
+                streaming=True,
+                trust_remote_code=True,
+            )
+            psbr = psbr.shuffle(seed=123, buffer_size=1000)
+            ray_ds_stream_ = ray.data.from_huggingface(psbr)
+
+            # Use batch-level text processing
+            ray_ds_stream_ = ray_ds_stream_.map_batches(
+                FarsiTextProcessor,
+                fn_constructor_kwargs={"text_column": "text"},
+                batch_size=500,
+                batch_format="pyarrow",
+                concurrency=5,
+                num_cpus=0.5,
+            )
+
+            # Audio processing
+            ray_ds_stream_ = ray_ds_stream_.map_batches(
+                AudioTableProcessor,
+                fn_constructor_kwargs={
+                    "audio_column": "audio.bytes",
+                    "audio_format": "flac",  # or "ogg", "wav", etc.
+                },
+                batch_size=50,
+                batch_format="pyarrow",
+                concurrency=5,
+                num_cpus=1,
+            )
+            ray_ds_stream_ = ray_ds_stream_.map_batches(
+                partial(
+                    map_to_target_schema,
+                    split=split,
+                    corpus="psbr",
+                ),
+                batch_size=100,
+                batch_format="pyarrow",
+            )
+            ray_ds_stream_.write_parquet(
+                output_dir,
+                partition_cols=["corpus", "split", "language"],
+                min_rows_per_file=10_000,
+                row_group_size=100,  # https://github.com/ray-project/ray/issues/52481
+            )
+
     def _ingest_persian_voice_cv_dataset_internal(
         self, output_dir: str, splits: list[str] | None = None
     ):
@@ -526,7 +761,9 @@ class DataPrepCLI:
         # see https://huggingface.co/datasets/vhdm/persian-voice-v1
 
         split_renaming = {"validation": "dev"}
-        splits_to_process = splits if splits is not None else ["test", "validation", "train"]
+        splits_to_process = (
+            splits if splits is not None else ["test", "validation", "train"]
+        )
         for split in splits_to_process:
             print(f"Ingesting {split} split...")
             cv = load_dataset(
@@ -546,7 +783,7 @@ class DataPrepCLI:
                 },
                 batch_size=1000,
                 batch_format="pyarrow",
-                concurrency=5,
+                concurrency=4,
                 num_cpus=0.5,
             )
 
@@ -555,11 +792,11 @@ class DataPrepCLI:
                 AudioTableProcessor,
                 fn_constructor_kwargs={
                     "audio_column": "audio.bytes",
-                    "audio_format": "mp3",  # or "ogg", "wav", etc.
+                    "audio_format": "flac",  # or "ogg", "wav", etc.
                 },
                 batch_size=50,
                 batch_format="pyarrow",
-                concurrency=5,
+                concurrency=4,
                 num_cpus=1,
             )
             ray_ds_stream_ = ray_ds_stream_.map_batches(
@@ -685,7 +922,109 @@ class DataPrepCLI:
         self.test_dataset(parquet_dataset_root, stats_path=stats_path, num_iterations=5)
         return parquet_dataset_root, stats_path
 
-    def run_short_farsi_voice_dataset(
+    def run_filimo_dataset(
+        self, output_dir: str, name: str = "filimo", version: str = "0"
+    ):
+        """Run short data preparation pipeline (only 2 languages from FLEURS for quick testing).
+
+        Args:
+            output_dir: Base output directory path
+            name: Dataset name (default: "all_asr_short")
+            version: Dataset version (default: "0")
+        """
+        print("🚀 Starting FILIMO data preparation pipeline")
+        print(f"📁 Output directory: {output_dir}")
+        print(f"📊 Dataset name: {name}, Version: {version}")
+
+        parquet_dataset_root = str(Path(output_dir) / f"{name}/version={version}/")
+
+        # Only ingest FLEURS with short subset (no MLS for speed)
+        print("🔄 Ingesting Farsi Voice Dataset with short portion subset...")
+        self._ingest_filimo_dataset_internal(parquet_dataset_root)
+
+        # Compute statistics
+        stats_path = Path(output_dir) / f"{name}/language_distribution_{version}.tsv"
+        self.compute_stats(parquet_dataset_root, str(stats_path))
+
+        print("✅ SHORT pipeline finished successfully!")
+        print(f"📈 Dataset ready at: {parquet_dataset_root}")
+        print(f"📊 Statistics saved at: {stats_path}")
+
+        # Test the dataset
+        self.test_dataset(parquet_dataset_root, stats_path=stats_path, num_iterations=5)
+        return parquet_dataset_root, stats_path
+
+    def run_psbr_dataset(
+        self, output_dir: str, name: str = "filimo", version: str = "0"
+    ):
+        """Run short data preparation pipeline (only 2 languages from FLEURS for quick testing).
+
+        Args:
+            output_dir: Base output directory path
+            name: Dataset name (default: "all_asr_short")
+            version: Dataset version (default: "0")
+        """
+        print("🚀 Starting SHORT data preparation pipeline")
+        print(f"📁 Output directory: {output_dir}")
+        print(f"📊 Dataset name: {name}, Version: {version}")
+
+        parquet_dataset_root = str(Path(output_dir) / f"{name}/version={version}/")
+
+        # Only ingest FLEURS with short subset (no MLS for speed)
+        print("🔄 Ingesting PSBR Dataset...")
+        self._ingest_psbr_dataset_internal(parquet_dataset_root)
+
+        # Compute statistics
+        stats_path = Path(output_dir) / f"{name}/language_distribution_{version}.tsv"
+        self.compute_stats(parquet_dataset_root, str(stats_path))
+
+        print("✅ SHORT pipeline finished successfully!")
+        print(f"📈 Dataset ready at: {parquet_dataset_root}")
+        print(f"📊 Statistics saved at: {stats_path}")
+
+        # Test the dataset
+        self.test_dataset(parquet_dataset_root, stats_path=stats_path, num_iterations=5)
+        return parquet_dataset_root, stats_path
+
+    def run_youtube_dataset(
+        self, output_dir: str, name: str = "youtube", version: str = "0"
+    ):
+        """Run short data preparation pipeline (only 2 languages from FLEURS for quick testing).
+
+        Args:
+            output_dir: Base output directory path
+            name: Dataset name (default: "all_asr_short")
+            version: Dataset version (default: "0")
+        """
+        portions = ["youtube"]
+        print("🚀 Starting SHORT data preparation pipeline")
+        print(f"📁 Output directory: {output_dir}")
+        print(f"📊 Dataset name: {name}, Version: {version}")
+        print(
+            f"🌍 Processing only {len(portions)} portions from Farsi Voice Dataset: {portions}"
+        )
+
+        parquet_dataset_root = str(Path(output_dir) / f"{name}/version={version}/")
+
+        # Only ingest FLEURS with short subset (no MLS for speed)
+        print("🔄 Ingesting Farsi Voice Dataset with short portion subset...")
+        self._ingest_youtube_dataset_internal(
+            parquet_dataset_root, portion_subset=portions
+        )
+
+        # Compute statistics
+        stats_path = Path(output_dir) / f"{name}/language_distribution_{version}.tsv"
+        self.compute_stats(parquet_dataset_root, str(stats_path))
+
+        print("✅ SHORT pipeline finished successfully!")
+        print(f"📈 Dataset ready at: {parquet_dataset_root}")
+        print(f"📊 Statistics saved at: {stats_path}")
+
+        # Test the dataset
+        self.test_dataset(parquet_dataset_root, stats_path=stats_path, num_iterations=5)
+        return parquet_dataset_root, stats_path
+
+    def run_farsi_voice_dataset(
         self, output_dir: str, name: str = "farsi_voice_short", version: str = "0"
     ):
         """Run short data preparation pipeline (only 2 languages from FLEURS for quick testing).
@@ -722,7 +1061,7 @@ class DataPrepCLI:
         # Test the dataset
         self.test_dataset(parquet_dataset_root, stats_path=stats_path, num_iterations=5)
         return parquet_dataset_root, stats_path
-    
+
     def run_persian_voice_cv(
         self, output_dir: str, name: str = "farsi_voice_short", version: str = "0"
     ):
@@ -741,7 +1080,7 @@ class DataPrepCLI:
 
         # Only ingest FLEURS with short subset (no MLS for speed)
         print("🔄 Ingesting Farsi Voice Dataset with short portion subset...")
-        self._ingest_persian_voice_cv_dataset_internal(parquet_dataset_root, splits=["test"])
+        self._ingest_persian_voice_cv_dataset_internal(parquet_dataset_root)
 
         # Compute statistics
         stats_path = Path(output_dir) / f"{name}/language_distribution_{version}.tsv"
@@ -793,12 +1132,25 @@ class DataPrepCLI:
         self.test_dataset(parquet_dataset_root, stats_path=stats_path)
         return parquet_dataset_root, stats_path
 
+    def run_all_asr_dataset(
+        self, output_dir: str, name: str = "farsi_voice_short", version: str = "0"
+    ):
+        self.run_youtube_dataset(output_dir, name, version)
+        self.run_filimo_dataset(output_dir, name, version)
+        self.run_farsi_voice_dataset(output_dir, name, version)
+        self.run_psbr_dataset(output_dir, name, version)
+
 
 if __name__ == "__main__":
     # Initialize Ray if not already initialized
-    max_memory_usage = 12  # GB
+    max_memory_usage = 20  # GB
     if not ray.is_initialized():
-        context = ray.init(object_store_memory=max_memory_usage * 1024 * 1024 * 1024)
+        context = ray.init(
+            object_store_memory=max_memory_usage * 1024 * 1024 * 1024,
+            object_spilling_directory="../spilling",
+            logging_level=logging.ERROR,
+            log_to_driver=False,
+        )
         print("dashboard:", context.dashboard_url)
 
     try:
